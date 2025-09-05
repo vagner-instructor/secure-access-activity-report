@@ -16,9 +16,13 @@ This repository shows a simple example downloading the activity data in the Cisc
 This repository contains a small python code [example workflow](./code/cisco-secure-access-report.py). 
 
 First - The python requests CLIENT ID and CLIENT SECRET
+
 Second - It tests the credentials and replies if it's incorrect
+
 Third - It requests YEAR MONTH DAY(s)
+
 Forth - It runs downloading the data to a .CSV file
+
 
 The time varies depending the customer's environment
 
@@ -92,6 +96,7 @@ This project was written and is maintained by the following individual(s):
 ## Credit(s)
 
 * Victor Azevedo 
+
 
 
 
