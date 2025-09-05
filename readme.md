@@ -42,12 +42,17 @@ cd secure-access-activity-report
 ### Pre-requisites
 
 Secure Access CLIENT ID and CLIENT SECRET
+
 Period needed for the report
 
 Python libs
+
 import requests
+
 import time
+
 import csv
+
 import calendar
 
 
@@ -96,6 +101,7 @@ This project was written and is maintained by the following individual(s):
 ## Credit(s)
 
 * Victor Azevedo 
+
 
 
 
