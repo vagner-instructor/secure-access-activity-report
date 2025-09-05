@@ -13,7 +13,7 @@ This repository shows a simple example downloading the activity data in the Cisc
 
 ![Data Flow Overview](./images/data_flow_overview.png)
 
-This repository contains a small python code [example workflow](./mcode/cisco-secure-access-report.py). 
+This repository contains a small python code [example workflow](./code/cisco-secure-access-report.py). 
 
 First - The python requests CLIENT ID and CLIENT SECRET
 Second - It tests the credentials and replies if it's incorrect
@@ -92,4 +92,5 @@ This project was written and is maintained by the following individual(s):
 ## Credit(s)
 
 * Victor Azevedo 
+
 
