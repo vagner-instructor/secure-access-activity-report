@@ -45,15 +45,15 @@ Secure Access CLIENT ID and CLIENT SECRET
 
 Period needed for the report
 
-Python libs
+. Python libs:
 
-import requests
+requests
 
-import time
+time
 
-import csv
+csv
 
-import calendar
+calendar
 
 
 ## How to test the remediation module
@@ -101,6 +101,7 @@ This project was written and is maintained by the following individual(s):
 ## Credit(s)
 
 * Victor Azevedo 
+
 
 
 
