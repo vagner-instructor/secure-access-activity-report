@@ -11,7 +11,7 @@ The Cisco Secure Access Python script for activity report in this repository req
 
 This repository shows a simple example downloading the activity data in the Cisco Secure Access
 
-![Data Flow Overview](./images/data_flow_overview.png)
+![Cisco Secure Access Architecture Overview](./images/cisco-secure-access-architecture-overview.png)
 
 This repository contains a small python code [example workflow](./code/cisco-secure-access-report.py). 
 
@@ -92,5 +92,6 @@ This project was written and is maintained by the following individual(s):
 ## Credit(s)
 
 * Victor Azevedo 
+
 
 
