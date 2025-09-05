@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Cisco Secure Access
+Author: Vagner Silva
+Credits: Victor Azevedo
+"""
 
 import requests
 import time
