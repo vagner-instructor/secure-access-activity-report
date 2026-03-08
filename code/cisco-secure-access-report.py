@@ -4,6 +4,9 @@
 Cisco Secure Access
 Author: Vagner Silva
 Credits: Victor Azevedo
+
+UPDATED: Automatic region detection, robust redirect handling,
+and auto-incremented CSV filename creation (_001, _002, ...)
 """
 
 import requests
@@ -13,23 +16,25 @@ from datetime import datetime, timedelta
 import csv
 import json
 import re
+import os
+import configparser
+import sys
 
 # =============================
-# CONSTANTES / ENDPOINTS
+# INITIAL AUTH / FALLBACKS
 # =============================
-API_BASE = "https://api.sse.cisco.com"
-AUTH_URL = f"{API_BASE}/auth/v2/token"
-# ACTIVITY_ENDPOINT will be determined dynamically based on event_type_filter
-CATEGORIES_ENDPOINT = f"{API_BASE}/reports/v2/categories"
+AUTH_HOST = "https://api.sse.cisco.com"
+AUTH_URL = f"{AUTH_HOST}/auth/v2/token"
+# default reports base (will be overridden after auth)
+REPORTS_BASE = "https://api.umbrella.com/reports.us"
+
+CATEGORIES_PATH = "/reports/v2/categories"
+ACTIVITY_PATH = "/reports/v2/activity"
 
 # =============================
-# UTILITÁRIOS DE TEMPO
+# TIME UTILITIES
 # =============================
 def dt_to_epoch_millis(dt: datetime) -> int:
-    """
-    Converte datetime NAIVE (interpretado como hora local) para epoch em milissegundos.
-    Mantém o comportamento que funcionava antes (equivalente a time.mktime).
-    """
     return int(time.mktime(dt.timetuple()) * 1000)
 
 def fmt_dt(dt: datetime) -> str:
@@ -39,7 +44,26 @@ def elapsed(start_ts: float) -> str:
     return str(timedelta(seconds=int(time.time() - start_ts)))
 
 # =============================
-# RATE LIMITER (MÁX 18000/HORA para Reporting API)
+# UNIQUE FILENAME GENERATOR
+# =============================
+def get_unique_filename(filename: str) -> str:
+    """
+    If filename exists, append _001, _002, etc., before the extension.
+    Example:
+        report.csv -> report_001.csv
+    """
+    if not os.path.exists(filename):
+        return filename
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    while True:
+        new_filename = f"{base}_{counter:03d}{ext}"
+        if not os.path.exists(new_filename):
+            return new_filename
+        counter += 1
+
+# =============================
+# RATE LIMITER
 # =============================
 class RateLimiter:
     def __init__(self, max_requests=18000, per_seconds=3600):
@@ -53,157 +77,213 @@ class RateLimiter:
         if now - self.window_start >= self.per_seconds:
             self.window_start = now
             self.count = 0
-
         if self.count >= self.max_requests:
             wait = int(self.per_seconds - (now - self.window_start))
             if wait < 0:
                 wait = 0
-            print(f"\n⏸️ Rate limit atingido ({self.max_requests}/hora). Aguardando {wait}s...")
+            print(f"\n⏸️ Rate limit reached ({self.max_requests}/hour). Waiting {wait}s...")
             time.sleep(wait)
             self.window_start = time.time()
             self.count = 0
-
         self.count += 1
 
 # =============================
-# AUTENTICAÇÃO
+# AUTHENTICATION
 # =============================
-def get_token(client_id: str, client_secret: str) -> str:
-    resp = requests.post(
-        AUTH_URL,
-        data={"grant_type": "client_credentials"},
-        auth=(client_id, client_secret),
-        timeout=30
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+def discover_region_from_headers(headers: dict) -> str:
+    """
+    Read known headers that may indicate the region to use (e.g. x-region-redirect).
+    Returns a short region code (e.g. 'us', 'eu') or a hostname if present.
+    """
+    for h in ("x-region-redirect", "x-region", "x-region-host", "x-region-name"):
+        v = headers.get(h)
+        if v:
+            v = v.strip()
+            if v.startswith("reports."):
+                v = v.replace("reports.", "")
+            if v.startswith("https://") or v.startswith("http://"):
+                try:
+                    import urllib.parse as _up
+                    parsed = _up.urlparse(v)
+                    host = parsed.hostname or "us"
+                    if host.startswith("reports."):
+                        region = host.split(".", 1)[1] if "." in host else host
+                        return region
+                except Exception:
+                    pass
+            return v
+    return "us"
+
+def get_token_and_reports_base(client_id: str, client_secret: str, timeout: int = 30) -> tuple[str, str]:
+    """
+    Request client credentials token and discover the proper reports base URL.
+    Returns: (access_token, reports_base_url)
+    """
+    try:
+        resp = requests.post(
+            AUTH_URL,
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to obtain token: {e}")
+
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError(f"No access_token in auth response: {data}")
+
+    region = discover_region_from_headers(resp.headers)
+    reports_base = "https://api.umbrella.com/reports.us"
+    if region:
+        # if header is simple region code like 'us' or 'eu'
+        if re.fullmatch(r"[a-zA-Z]{2,8}", region):
+            reports_base = f"https://api.umbrella.com/reports.{region}"
+        else:
+            # region may be a hostname or reports.<region>
+            if region.startswith("reports."):
+                reports_base = f"https://{region}"
+            elif "." in region:
+                reports_base = f"https://{region}"
+            else:
+                reports_base = f"https://api.umbrella.com/reports.{region}"
+
+    return token, reports_base
 
 def prompt_credentials_with_test() -> tuple[str, str, str]:
-    """
-    Pide CLIENT_ID/CLIENT_SECRET hasta conseguir un token válido.
-    Retorna (client_id, client_secret, token).
-    """
+    # global must be declared at top because we assign to it inside
+    global REPORTS_BASE
     while True:
         client_id = input("🔑 CLIENT_ID: ").strip()
         client_secret = input("🔑 CLIENT_SECRET: ").strip()
         try:
-            token = get_token(client_id, client_secret)
-            print("✅ Autenticación OK.\n")
+            token, reports_base = get_token_and_reports_base(client_id, client_secret)
+            print(f"✅ Authentication OK. Reports base: {reports_base}\n")
+            REPORTS_BASE = reports_base
             return client_id, client_secret, token
-        except requests.HTTPError as e:
-            msg = ""
-            try:
-                msg = e.response.text[:200]
-            except Exception:
-                pass
-            print(f"❌ Falha na autenticação ({e}). Detalhe: {msg}")
-            print("Tente novamente.\n")
         except Exception as e:
-            print(f"❌ Erro inesperado ao obter token: {e}")
-            print("Tente novamente.\n")
+            print(f"❌ Authentication failed: {e}")
+            print("Please try again.\n")
 
 # =============================
-# PROMPT INTERACTIVO DE DATA
+# READ CATEGORIES FROM INI FILE
 # =============================
-def interactive_prompt_dates() -> tuple[int, int, list[int], int]:
-    anos = [2025, 2024, 2023, 2022, 2021]
-    print("Selecione o ano:")
-    for i, a in enumerate(anos, 1):
-        print(f"{i}. {a}")
+def read_category_list_from_ini(file_path: str) -> dict:
+    config = configparser.ConfigParser()
+    config.read(file_path)
+    categories = {}
+    if 'Categories' in config:
+        for key, value in config['Categories'].items():
+            try:
+                categories[int(key)] = value
+            except Exception:
+                pass
+    return categories
+
+# =============================
+# INTERACTIVE DATE PROMPT
+# =============================
+def interactive_prompt_dates() -> tuple[int, int, list[int], str]:
+    years = [2026, 2025, 2024, 2023, 2022, 2021]
+    print("Select the year:")
+    for i, y in enumerate(years, 1):
+        print(f"{i}. {y}")
     while True:
         try:
-            ano_idx = int(input("Ano (número): "))
-            if 1 <= ano_idx <= len(anos):
-                ano = anos[ano_idx - 1]
+            year_idx = int(input("Year (number): "))
+            if 1 <= year_idx <= len(years):
+                year = years[year_idx - 1]
                 break
         except ValueError:
             pass
-        print("Entrada inválida. Tente novamente.")
-    meses = ["janeiro","fevereiro","março","abril","maio","junho",
-             "julho","agosto","setembro","outubro","novembro","dezembro"]
-    print("\nSelecione o mês:")
-    for i, m in enumerate(meses, 1):
+        print("Invalid input. Please try again.")
+
+    months = ["January","February","March","April","May","June",
+              "July","August","September","October","November","December"]
+    print("\nSelect the month:")
+    for i, m in enumerate(months, 1):
         print(f"{i}. {m}")
     while True:
         try:
-            mes = int(input("Mês (número): "))
-            if 1 <= mes <= 12:
+            month = int(input("Month (number): "))
+            if 1 <= month <= 12:
                 break
         except ValueError:
             pass
-        print("Entrada inválida. Tente novamente.")
-    max_dia = calendar.monthrange(ano, mes)[1]
-    print("\nSelecione o dia:")
-    print("0. Todos os dias do mês")
+        print("Invalid input. Please try again.")
+
+    max_day = calendar.monthrange(year, month)[1]
+    print(f"\nSelect day(s) (1-{max_day}):")
+    print("0. All days of the month")
+    print("Or enter multiple days separated by commas, e.g., 8,15,26")
     while True:
         try:
-            dia = int(input("Dia (número ou 0): "))
-            if 0 <= dia <= max_dia:
+            day_input = input("Day(s): ").strip()
+            if day_input == "0":
+                days_to_process = list(range(1, max_day + 1))
+                selected_day_for_filename = "all"
                 break
+            else:
+                days_to_process = sorted({int(d.strip()) for d in day_input.split(",") if d.strip().isdigit()})
+                if all(1 <= d <= max_day for d in days_to_process):
+                    selected_day_for_filename = "_".join(str(d) for d in days_to_process)
+                    break
         except ValueError:
             pass
-        print("Entrada inválida. Tente novamente.")
-    dias_to_process = list(range(1, max_dia + 1)) if dia == 0 else [dia]
-    return ano, mes, dias_to_process, dia
+        print("Invalid input. Please enter numbers between 1 and", max_day)
+
+    return year, month, days_to_process, selected_day_for_filename
 
 # =============================
-# OBTENER TODAS LAS CATEGORIAS
+# GET ALL AVAILABLE CATEGORIES - HANDLE REDIRECT
 # =============================
 def get_all_available_categories(token: str) -> list[dict]:
-    """
-    Obtiene TODAS las categorías de la API.
-    """
     headers = {"Authorization": f"Bearer {token}"}
+    endpoint = f"{REPORTS_BASE}{CATEGORIES_PATH}"
     try:
-        resp = requests.get(CATEGORIES_ENDPOINT, headers=headers, timeout=30)
+        resp = requests.get(endpoint, headers=headers, timeout=30, allow_redirects=False)
+        if resp.status_code == 302:
+            redirected_url = resp.headers.get("Location")
+            if not redirected_url:
+                print("❌ 302 redirect without Location header")
+                return []
+            print(f"🔹 Following redirect to: {redirected_url}")
+            resp = requests.get(redirected_url, headers=headers, timeout=30)
         resp.raise_for_status()
-        
         all_categories_response = resp.json()
-        all_categories = all_categories_response.get('data', [])
-        
+        all_categories = all_categories_response.get("data", [])
         if isinstance(all_categories, list):
             print("\n--- All Available Categories from API (ID, Type, Label) ---")
-            sorted_categories = sorted(all_categories, key=lambda x: (x.get('type', ''), x.get('label', '')))
+            sorted_categories = sorted(all_categories, key=lambda x: (x.get("type", ""), x.get("label", "")))
             for cat in sorted_categories:
                 if isinstance(cat, dict):
                     print(f"  ID: {cat.get('id')}, Type: '{cat.get('type')}', Label: '{cat.get('label')}'")
             print("-----------------------------------------------------------")
             return all_categories
         else:
-            print(f"❌ La respuesta de {CATEGORIES_ENDPOINT} no contiene una lista en la clave 'data'. Tipo de 'data': {type(all_categories)}")
+            print(f"❌ API response does not contain a list in 'data'. Type: {type(all_categories)}")
             return []
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error al obtener categorías desde la API: {e}")
+        print(f"❌ Error fetching categories from API: {e}")
         return []
 
 # =============================
-# DOWNLOAD DE JANELA COM PAGINAÇÃO
+# FETCH ACTIVITY WINDOW WITH REDIRECT AND 403 HANDLING
 # =============================
-def fetch_activity_window(
-    token: str,
-    client_id: str,
-    client_secret: str,
-    from_ts: int,
-    to_ts: int,
-    limit: int = 1000,
-    offset_ceiling: int | None = None,
-    verbose: bool = False,
-    rate_limiter: RateLimiter | None = None,
-    filters: dict | None = None,
-    activity_endpoint_url: str = f"{API_BASE}/reports/v2/activity" # Dynamic endpoint URL
-) -> tuple[list[dict], bool, str]:
-    """
-    Busca eventos entre from_ts y to_ts (epoch ms), paginando por offset.
-    Retorna (eventos, need_minute_fallback, token_atualizado).
-    Activa fallback minuto-a-minuto si:
-      - HTTP 400/404; o
-      - offset >= offset_ceiling (Ex.: 10000).
-    Hace retry de red con backoff y renueva token en 403 (hasta 5x).
-    """
-    offset = 0
-    events: list[dict] = []
-    need_minute_fallback = False
+def fetch_activity_window(token, client_id, client_secret, from_ts, to_ts,
+                          limit=1000, offset_ceiling=None, verbose=False,
+                          rate_limiter=None, filters=None,
+                          activity_endpoint_url=None):
+    # we may update REPORTS_BASE on token refresh; declare global at top
+    global REPORTS_BASE
 
+    # activity_endpoint_url is expected to be a fully qualified URL (no params)
+    offset = 0
+    events = []
+    need_minute_fallback = False
     consecutive_403 = 0
     max_403_attempts = 5
     max_retries_conn = 5
@@ -212,104 +292,105 @@ def fetch_activity_window(
         if offset_ceiling is not None and offset >= offset_ceiling:
             need_minute_fallback = True
             if verbose:
-                print(f"   ⚠️ Offset {offset} >= ceiling {offset_ceiling}. Ativando fallback minuto-a-minuto.")
+                print(f"   ⚠️ Offset {offset} >= ceiling {offset_ceiling}. Activating fallback minute-by-minute.")
             break
 
         if rate_limiter:
             rate_limiter.check()
 
-        params = {
-            "from": str(from_ts),
-            "to": str(to_ts),
-            "limit": limit,
-            "offset": offset
-        }
+        params = {"from": str(from_ts), "to": str(to_ts), "limit": limit, "offset": offset}
         if filters:
             params.update(filters)
-        
-        headers = {"Authorization": f"Bearer {token}"}
 
+        headers = {"Authorization": f"Bearer {token}"}
         resp = None
+
+        # Connection retry loop
         for attempt in range(max_retries_conn):
             try:
-                resp = requests.get(activity_endpoint_url, headers=headers, params=params, timeout=60)
+                resp = requests.get(activity_endpoint_url, headers=headers, params=params, timeout=60, allow_redirects=False)
                 break
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError,
                     requests.exceptions.ReadTimeout) as e:
-                wait = (2 ** attempt)
-                print(f"   ⚠️ Erro de conexão ({e}). Tentando novamente em {wait}s...")
+                wait = 2 ** attempt
+                print(f"   ⚠️ Connection error ({e}). Retrying in {wait}s...")
                 time.sleep(wait)
+
         if resp is None:
-            print("   🚨 Falhas de conexão repetidas. Abortando este intervalo.")
+            print("   🚨 Repeated connection failures. Aborting this interval.")
             break
 
+        # Handle redirect (302)
+        if resp.status_code == 302:
+            redirected_url = resp.headers.get("Location")
+            if redirected_url:
+                if verbose:
+                    print(f"🔹 Following redirect to: {redirected_url}")
+                try:
+                    # follow the redirect with the same headers/params
+                    resp = requests.get(redirected_url, headers=headers, params=params, timeout=60)
+                except Exception as e:
+                    print(f"   ❌ Failed to fetch redirected URL: {e}")
+                    break
+            else:
+                print("   ❌ 302 redirect received but no Location header.")
+                break
+
+        # Success
         if resp.status_code == 200:
             try:
                 payload = resp.json()
             except Exception as e:
-                print(f"   ⚠️ Erro ao decodificar JSON: {e}. Cuerpo (200 chars): {resp.text[:200]}")
+                print(f"   ⚠️ Failed to parse JSON: {e}, response: {resp.text[:200]}")
                 break
-
             batch = payload.get("data", [])
             if not batch:
                 break
-
             events.extend(batch)
             offset += len(batch)
-
             if verbose:
-                print(f"      🔹 {len(batch)} eventos (offset agora {offset})")
-
+                print(f"      🔹 {len(batch)} events fetched (offset now {offset})")
             consecutive_403 = 0
             if len(batch) < limit:
                 break
-
             continue
 
+        # 403 handling -> refresh token and possibly region
         if resp.status_code == 403:
             consecutive_403 += 1
-            print(f"   ⚠️ HTTP 403 detectado ({consecutive_403}/{max_403_attempts}). Renovando token e tentando de novo...")
+            print(f"   ⚠️ HTTP 403 detected ({consecutive_403}/{max_403_attempts}). Refreshing token...")
             try:
-                token = get_token(client_id, client_secret)
+                new_token, new_reports_base = get_token_and_reports_base(client_id, client_secret)
+                token = new_token
+                REPORTS_BASE = new_reports_base
             except Exception as e:
-                print(f"   ❌ Erro ao renovar token: {e}")
+                print(f"   ❌ Failed to refresh token: {e}")
                 time.sleep(5)
-
             if consecutive_403 >= max_403_attempts:
-                print("   🚨 403 persistente após varias renovaciones. Parando este intervalo.")
+                print("   🚨 Persistent 403 after several retries. Stopping this interval.")
                 break
             continue
 
+        # Client errors trigger minute fallback
         if resp.status_code in (400, 404):
             need_minute_fallback = True
-            print(f"   ⚠️ HTTP {resp.status_code} — ativando fallback minuto-a-minuto para essa hora.")
+            print(f"   ⚠️ HTTP {resp.status_code} — activating minute-by-minute fallback for this hour.")
             break
 
-        print(f"   ⚠️ HTTP {resp.status_code} retornado. Mensagem: {resp.text[:200]}")
+        # Other errors
+        print(f"   ⚠️ HTTP {resp.status_code} returned. Message: {resp.text[:200]}")
         break
 
     return events, need_minute_fallback, token
 
 # =============================
-# BUSCA DA HORA COM FALLBACK DE MINUTO
+# FETCH HOUR WITH MINUTE FALLBACK
 # =============================
-def fetch_hour_with_minute_fallback(
-    token: str,
-    client_id: str,
-    client_secret: str,
-    hour_start_dt: datetime,
-    limit: int = 1000,
-    offset_ceiling: int = 10000,
-    verbose: bool = True,
-    rate_limiter: RateLimiter | None = None,
-    filters: dict | None = None,
-    activity_endpoint_url: str = f"{API_BASE}/reports/v2/activity" # Dynamic endpoint URL
-) -> tuple[list[dict], str]:
-    """
-    Tenta buscar la hora entera. Si bate 400/404 o offset_ceiling,
-    cae para minuto-a-minuto (60 llamadas).
-    """
+def fetch_hour_with_minute_fallback(token, client_id, client_secret, hour_start_dt,
+                                    limit=1000, offset_ceiling=10000, verbose=True,
+                                    rate_limiter=None, filters=None,
+                                    activity_endpoint_url=None):
     hour_end_dt = hour_start_dt + timedelta(hours=1) - timedelta(milliseconds=1)
     from_ts = dt_to_epoch_millis(hour_start_dt)
     to_ts = dt_to_epoch_millis(hour_end_dt)
@@ -325,12 +406,12 @@ def fetch_hour_with_minute_fallback(
 
     if not need_minute_fallback:
         if verbose:
-            print(f"   ✅ Hour OK: {len(hour_events_from_api)} eventos")
+            print(f"   ✅ Hour OK: {len(hour_events_from_api)} events")
         return hour_events_from_api, token
 
-    collected: list[dict] = []
+    collected = []
     if verbose:
-        print("   ↪️ Iniciando fallback minuto-a-minuto (60 minutos).")
+        print("   ↪️ Starting minute-by-minute fallback (60 minutes).")
     for m in range(60):
         minute_start = hour_start_dt + timedelta(minutes=m)
         minute_end = minute_start + timedelta(minutes=1) - timedelta(milliseconds=1)
@@ -346,36 +427,28 @@ def fetch_hour_with_minute_fallback(
             rate_limiter=rate_limiter, filters=filters, activity_endpoint_url=activity_endpoint_url
         )
         collected.extend(minute_events)
-
         if verbose:
             print(f"   {len(minute_events)} events")
 
     if verbose:
-        print(f"   ✅ Fallback minute total: {len(collected)} eventos na hora {hour_start_dt.strftime('%Y-%m-%d %H:00')}")
+        print(f"   ✅ Fallback minute total: {len(collected)} events for hour {hour_start_dt.strftime('%Y-%m-%d %H:00')}")
     return collected, token
 
 # =============================
-# CSV
+# CSV UTILITIES
 # =============================
-def _parse_event_datetime(ev: dict) -> datetime | None:
-    """
-    Tenta montar um datetime do evento:
-      - se houver 'timestamp' ISO8601 string, usa;
-      - senão se houver 'timestamp' epoch em milissegundos, usa;
-      - senão combina 'date' (YYYY-MM-DD) + 'time' (HH:MM:SS), se existirem.
-    """
+def _parse_event_datetime(ev):
     ts_val = ev.get("timestamp")
     if isinstance(ts_val, str) and ts_val:
         try:
             return datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
         except ValueError:
-            pass # Fallback to other parsing
-    elif isinstance(ts_val, (int, float)): # Handle epoch milliseconds
+            pass
+    elif isinstance(ts_val, (int, float)):
         try:
-            return datetime.fromtimestamp(ts_val / 1000) # Convert milliseconds to seconds
+            return datetime.fromtimestamp(ts_val / 1000)
         except ValueError:
-            pass # Fallback to other parsing
-
+            pass
     d = ev.get("date")
     t = ev.get("time")
     if isinstance(d, str) and isinstance(t, str):
@@ -385,18 +458,13 @@ def _parse_event_datetime(ev: dict) -> datetime | None:
             pass
     return None
 
-def save_to_csv_custom_format(events: list[dict], writer: csv.DictWriter):
-    """
-    Salva eventos usando un writer CSV ya abierto, en el formato personalizado.
-    """
+def save_to_csv_custom_format(events, writer):
     for ev in events:
         dt = _parse_event_datetime(ev)
-        
-        # Policy Identity: Prioritize rule.label, then policy.name, then policyName, then identity.policyIdentity
         policy_identity = ''
-        if ev.get('rule', {}).get('label'):
+        if ev.get('rule', {}) and ev.get('rule', {}).get('label'):
             policy_identity = ev['rule']['label']
-        elif ev.get('policy', {}).get('name'):
+        elif ev.get('policy', {}) and ev.get('policy', {}).get('name'):
             policy_identity = ev['policy']['name']
         elif ev.get('policyName'):
             policy_identity = ev['policyName']
@@ -405,8 +473,6 @@ def save_to_csv_custom_format(events: list[dict], writer: csv.DictWriter):
                 if isinstance(id_data, dict) and id_data.get('policyIdentity'):
                     policy_identity = id_data['policyIdentity']
                     break
-
-        # Identities and Identity Types
         identities_data = ev.get('identities', [])
         identity_labels = []
         identity_types = []
@@ -415,75 +481,62 @@ def save_to_csv_custom_format(events: list[dict], writer: csv.DictWriter):
                 label = id_data.get('label')
                 if isinstance(label, str):
                     identity_labels.append(label)
-                
-                # Extract type from nested dictionary if present, or directly if string
                 id_type_obj = id_data.get('type')
                 if isinstance(id_type_obj, dict):
                     id_type_label = id_type_obj.get('label')
                     if isinstance(id_type_label, str):
                         identity_types.append(id_type_label)
                 elif isinstance(id_type_obj, str):
-                     identity_types.append(id_type_obj)
-        
-        # Categories
+                    identity_types.append(id_type_obj)
         categories_data = ev.get('categories', [])
         category_labels = [cat_data.get('label', '') for cat_data in categories_data if isinstance(cat_data, dict) and cat_data.get('label')]
-
         writer.writerow({
             "Date": dt.strftime("%Y-%m-%d") if dt else "",
             "Time": dt.strftime("%H:%M:%S") if dt else "",
             "Policy Identity": policy_identity,
-            "Identity Type": identity_types[0] if identity_types else "", # Assuming primary identity type
+            "Identity Type": identity_types[0] if identity_types else "",
             "Identities": "; ".join(identity_labels),
             "Identity Types": "; ".join(identity_types),
-            "Record Type": ev.get('recordType', ev.get('type', '')), # Use 'type' if 'recordType' is missing
+            "Record Type": ev.get('recordType', ev.get('type', '')),
             "Internal Ip Address": ev.get('internalip', ''),
             "External Ip Address": ev.get('externalip', ''),
             "Action": ev.get('verdict', ''),
-            "Destination": ev.get('domain', ev.get('dest', ev.get('url', ''))), # Prioritize domain, then dest, then url
+            "Destination": ev.get('domain', ev.get('dest', ev.get('url', ''))),
             "Categories": "; ".join(category_labels),
-            "Full Event JSON": json.dumps(ev, ensure_ascii=False) # New column
+            "Full Event JSON": json.dumps(ev, ensure_ascii=False)
         })
 
-def save_raw_events_to_csv(events: list[dict], writer: csv.DictWriter):
-    """
-    Salva eventos en formato CSV con el JSON completo del evento.
-    """
+def save_raw_events_to_csv(events, writer):
     for ev in events:
         dt = _parse_event_datetime(ev)
         writer.writerow({
             "timestamp": dt.isoformat() if dt else "",
-            "full_event_json": json.dumps(ev, ensure_ascii=False) # Save full event as JSON string
+            "full_event_json": json.dumps(ev, ensure_ascii=False)
         })
 
 def sanitize_filename(text: str) -> str:
-    """Sanitizes a string to be used as a filename segment."""
     text = text.replace(" ", "_")
-    text = re.sub(r'[^\w.-]', '', text) # Remove non-alphanumeric (except . and -)
+    text = re.sub(r'[^\w.\-]', '', text)
     return text.lower()
 
 # =============================
-# MAIN
+# MAIN FUNCTION
 # =============================
 def main():
-    # 1) Credenciais com teste
+    # 1) Credentials with test (this will also set REPORTS_BASE global)
     client_id, client_secret, token = prompt_credentials_with_test()
 
-    # 2) Prompt de datas (ano/mês/dia[s])
-    ano, mes, dias_to_process, selected_day_for_filename = interactive_prompt_dates()
+    # 2) Prompt for year/month/day(s)
+    year, month, days_to_process, selected_day_for_filename = interactive_prompt_dates()
 
-    # --- Event Type Selection ---
-    # Based on the documentation: https://developer.cisco.com/docs/cloud-security/secure-access-api-reference-reporting-overview/#request-query-parameters
+    # 3) Event Type Selection
     valid_event_types = ["dns", "proxy", "firewall", "ip", "ztna", "remote-access", "intrusion"]
-    event_type_filter = ''
     print("\n--- Select Event Type ---")
     for i, etype in enumerate(valid_event_types, 1):
         print(f"{i}. {etype}")
-    
     while True:
         try:
-            type_choice_idx = input(f"Enter the number for the event type (1-{len(valid_event_types)}): ").strip()
-            type_choice_idx = int(type_choice_idx)
+            type_choice_idx = int(input(f"Enter the number for the event type (1-{len(valid_event_types)}): ").strip())
             if 1 <= type_choice_idx <= len(valid_event_types):
                 event_type_filter = valid_event_types[type_choice_idx - 1]
                 break
@@ -491,202 +544,86 @@ def main():
             pass
         print("Invalid input. Please enter a valid number.")
 
-    activity_endpoint_url = f"{API_BASE}/reports/v2/activity/{event_type_filter}"
-    print(f"\n✅ Using dedicated activity endpoint: '{activity_endpoint_url}'")
+    # 4) Read category list from .ini file
+    categories_file_path = "category_list.ini"
+    predefined_categories = read_category_list_from_ini(categories_file_path)
 
-    # 3) Category Selection
-    all_available_categories = get_all_available_categories(token) # This call will now print ALL categories
-    
-    category_selection_choice = ''
-    if all_available_categories:
-        print("\n--- Category Filtering Options ---")
-        print("1. Use the predefined list of categories (each in its own CSV)")
-        print("2. Select a single category interactively from the full list (single CSV)")
-        print("3. Select multiple categories by ID (each in its own CSV)") # Updated text
-        print("0. No category filtering (single CSV)")
-        
-        while True:
-            try:
-                category_selection_choice = input("Enter your choice (0, 1, 2, or 3): ").strip()
-                if category_selection_choice in ['0', '1', '2', '3']:
-                    break
-            except ValueError:
-                pass
-            print("Invalid input. Please enter 0, 1, 2, or 3.")
-    else:
-        print("⚠️ Could not load any categories from the API. No category filtering will be applied.")
-        category_selection_choice = '0' # Force no category filtering if categories can't be loaded
+    # 5) Category selection
+    categories_to_process_list = []
+    category_selection_choice = '1'  # default
+    print("\n--- Category Filtering Options ---")
+    print("1. Predefined list of categories in the category_list.ini file (each category will have its own CSV generated)")
+    while True:
+        category_selection_choice = input("Enter your choice (1): ").strip()
+        if category_selection_choice in ['0', '1', '2', '3']:
+            break
+        print("Invalid input. Please enter 0, 1, 2, or 3.")
 
-    # --- CSV Format Selection (Applies to all generated CSVs) ---
+    if category_selection_choice == '1':
+        for cat_id, cat_name in predefined_categories.items():
+            categories_to_process_list.append(
+                ({"categories": str(cat_id)}, sanitize_filename(cat_name))
+            )
+
+    # 6) CSV format selection
     print("\n--- CSV Output Format Options ---")
     print("1. Custom formatted CSV (Date;Time;Policy Identity;...)")
     print("2. All Data (Raw JSON event in a column)")
-    
-    csv_format_choice = ''
     while True:
-        try:
-            csv_format_choice = input("Enter your choice (1 or 2): ").strip()
-            if csv_format_choice in ['1', '2']:
-                break
-        except ValueError:
-            pass
-        print("Invalid input. Please enter 1 or 2.")
+        csv_format_choice = input("Enter your choice (1 or 2): ").strip()
+        if csv_format_choice in ['1', '2']:
+            break
+        print("Invalid input. Enter 1 or 2.")
 
     if csv_format_choice == '1':
         csv_fieldnames = [
-            "Date", "Time", "Policy Identity", "Identity Type", "Identities", 
-            "Identity Types", "Record Type", "Internal Ip Address", 
+            "Date", "Time", "Policy Identity", "Identity Type", "Identities",
+            "Identity Types", "Record Type", "Internal Ip Address",
             "External Ip Address", "Action", "Destination", "Categories", "Full Event JSON"
         ]
         save_events_function = save_to_csv_custom_format
         csv_format_suffix = "custom"
-    else: # choice == '2'
+    else:
         csv_fieldnames = ["timestamp", "full_event_json"]
         save_events_function = save_raw_events_to_csv
         csv_format_suffix = "raw_json"
 
-    # --- Definir tus filtros de EXCLUSIÓN aquí (filtros del lado del cliente) ---
-    # Lista de nombres de usuario a excluir.
-    excluded_identity_names = {
-        "user_a",
-        "user_b",
-        "service_account_1"
-    }
-    # Si no quieres excluir ninguna identidad, déjalo como un set vacío:
-    # excluded_identity_names = set()
-    # -----------------------------------------------------------------------------
+    # 7) Exclusion filters
+    excluded_identity_names = {"user_a", "user_b", "service_account_1"}
 
-    # --- Prepare for data fetching based on category selection ---
-    categories_to_process_list = [] # List of (api_filter_dict, filename_segment) tuples
-    
-    if category_selection_choice == '1': # Predefined list, each in its own CSV
-        requested_category_names_raw = [
-            "Adult",
-            "Advertisements",
-            "Online Storage and Backup",
-            "Illegal Downloads",
-            "File Transfer Services",
-            "DoH and DoT ou Personal VPN", 
-            "Streaming Video",
-            "Infrastructure and Content Delivery Networks"
-        ]
-        
-        requested_category_names = []
-        for name in requested_category_names_raw:
-            if name == "DoH and DoT ou Personal VPN":
-                requested_category_names.extend(["Encrypted DNS", "Personal VPN"]) # Corrected for API labels
-            else:
-                requested_category_names.append(name)
+    # 8) Optional action filter: "allowed" or "blocked"
+    action_filter = None
+    print("\n--- Action Filter ---")
+    print("1. No filter")
+    print("2. Only allowed (Action=Allowed)")
+    print("3. Only blocked (Action=Blocked)")
+    while True:
+        af_choice = input("Enter your choice (1/2/3): ").strip()
+        if af_choice == "2":
+            action_filter = "allowed"
+            break
+        elif af_choice == "3":
+            action_filter = "blocked"
+            break
+        elif af_choice == "1":
+            break
+        print("Invalid input. Please enter 1, 2, or 3.")
 
-        category_label_to_info = {re.sub(r'[^a-z0-9]', '', cat['label'].lower()): cat for cat in all_available_categories}
-        
-        print("\n--- Attempting to match your predefined categories ---")
-        for req_name in requested_category_names:
-            cleaned_req_name = re.sub(r'[^a-z0-9]', '', req_name.lower())
-            cat_info = category_label_to_info.get(cleaned_req_name)
-            if cat_info:
-                categories_to_process_list.append(
-                    ({"categories": str(cat_info['id'])}, sanitize_filename(cat_info['label']))
-                )
-                print(f"✅ Matched '{req_name}' (Type: {cat_info['type']}) to ID: {cat_info['id']}")
-            else:
-                print(f"⚠️ Could not find category ID for '{req_name}' (cleaned: '{cleaned_req_name}'). Please check the 'All Available Categories from API' list above for exact names.")
-        print("----------------------------------------------------")
-        
-        if not categories_to_process_list:
-            print("⚠️ No predefined categories were matched. No category-specific CSVs will be generated for this option.")
-            return # Exit main if no categories to process for option 1
+    # DEBUG info
+    print(f"\nDEBUG: days_to_process={days_to_process}")
+    print(f"DEBUG: categories_to_process_list={categories_to_process_list}")
 
-    elif category_selection_choice == '2': # Single interactive category
-        print("\n--- Select a single category by ID ---")
-        
-        available_ids = {cat['id'] for cat in all_available_categories if 'id' in cat}
-        selected_id = None
-        while True:
-            try:
-                selected_id_str = input("Enter the ID of the category you want to filter by: ").strip()
-                selected_id = int(selected_id_str)
-                if selected_id in available_ids:
-                    selected_cat_info = next((cat for cat in all_available_categories if cat['id'] == selected_id), None)
-                    categories_to_process_list.append(
-                        ({"categories": str(selected_id)}, sanitize_filename(selected_cat_info['label']))
-                    )
-                    print(f"✅ Selected category: '{selected_cat_info['label']}' (ID: {selected_id}, Type: {selected_cat_info['type']})")
-                    break
-                else:
-                    print(f"Invalid ID: {selected_id}. Please enter a valid category ID from the list above.")
-            except ValueError:
-                print("Invalid input. Please enter a number.")
-        print("----------------------------------------------------")
+    # 9) Main fetching loop
+    total_categories = len(categories_to_process_list)
 
-    elif category_selection_choice == '3': # Multiple interactive categories, each in its own CSV
-        print("\n--- Select multiple categories by ID (comma-separated, e.g., 161,27,9) ---")
-        print("Please refer to the 'All Available Categories from API' list above for IDs.")
-        
-        available_ids_set = {cat['id'] for cat in all_available_categories if 'id' in cat}
-        selected_ids_for_multi = []
-        
-        while True:
-            input_ids_str = input("Enter category IDs (comma-separated): ").strip()
-            if not input_ids_str:
-                print("No IDs entered. Please try again.")
-                continue
-            
-            raw_ids = [s.strip() for s in input_ids_str.split(',') if s.strip()]
-            
-            valid_ids_in_input = []
-            invalid_inputs = []
-            for id_str in raw_ids:
-                try:
-                    num_id = int(id_str)
-                    if num_id in available_ids_set:
-                        valid_ids_in_input.append(num_id)
-                    else:
-                        invalid_inputs.append(id_str)
-                except ValueError:
-                    invalid_inputs.append(id_str)
-            
-            if invalid_inputs:
-                print(f"Invalid or unknown IDs entered: {', '.join(invalid_inputs)}. Please re-enter all IDs correctly.")
-            elif not valid_ids_in_input:
-                print("No valid category IDs selected. Please try again.")
-            else:
-                selected_ids_for_multi = list(set(valid_ids_in_input)) # Remove duplicates
-                selected_ids_for_multi.sort() # For consistent output
-                print(f"✅ Selected categories with IDs: {selected_ids_for_multi}")
+    for cat_idx, (current_api_filters, current_category_filename_segment) in enumerate(categories_to_process_list, start=1):
+        csv_file = f"activity_{year}_{month:02d}_{selected_day_for_filename}_{current_category_filename_segment}_{event_type_filter}_{csv_format_suffix}.csv"
+        # ensure unique filename using _001, _002 pattern
+        csv_file = get_unique_filename(csv_file)
 
-                # For each selected ID, create a separate entry in categories_to_process_list
-                for cat_id in selected_ids_for_multi:
-                    selected_cat_info = next((cat for cat in all_available_categories if cat['id'] == cat_id), None)
-                    if selected_cat_info:
-                        categories_to_process_list.append(
-                            ({"categories": str(cat_id)}, sanitize_filename(selected_cat_info['label']))
-                        )
-                break
-        print("----------------------------------------------------")
-
-    else: # category_selection_choice == '0' or no categories loaded
-        print("⚠️ No specific categories selected for filtering. Fetching all events without category filter.")
-        categories_to_process_list.append(
-            ({}, "no_cat_filter") # Empty filters, generic filename suffix
-        )
-    
-    # --- Main Data Fetching and CSV Writing Loop ---
-    if not categories_to_process_list:
-        print("❌ No categories were selected for processing. Exiting.")
-        return
-
-    for current_api_filters, current_category_filename_segment in categories_to_process_list:
-        csv_file = f"activity_{ano}_{mes:02d}_{selected_day_for_filename:02d}_{current_category_filename_segment}_{event_type_filter}_{csv_format_suffix}.csv"
-        
-        print(f"\n🚀 Starting data collection for category '{current_category_filename_segment}' into '{csv_file}'")
-
-        file_exists = False
-        try:
-            with open(csv_file, "r", encoding="utf-8"):
-                file_exists = True
-        except FileNotFoundError:
-            pass
+        print(f"\n🚀 Starting collection for category {cat_idx}/{total_categories}: '{current_category_filename_segment}'")
+        print(f"📂 Saving into file: '{csv_file}'")
+        file_exists = os.path.exists(csv_file)
 
         with open(csv_file, "a", newline="", encoding="utf-8") as f:
             csv_writer = csv.DictWriter(f, fieldnames=csv_fieldnames, delimiter=';')
@@ -694,54 +631,55 @@ def main():
                 csv_writer.writeheader()
 
             rate_limiter = RateLimiter(max_requests=18000, per_seconds=3600)
-
             start_time = time.time()
             total_events_for_this_category = 0
-            for idx, current_day in enumerate(dias_to_process):
-                print(f"\n📅 Dia: {current_day} ({idx+1}/{len(dias_to_process)})")
+
+            for idx, current_day in enumerate(days_to_process):
+                print(f"\n📅 Day: {current_day} ({idx + 1}/{len(days_to_process)})")
                 for hour in range(24):
-                    hour_start = datetime(ano, mes, current_day, hour, 0, 0)
-                    print(f"⏱️ Tempo decorrido: {elapsed(start_time)}")
+                    hour_start = datetime(year, month, current_day, hour, 0, 0)
+                    print(f"⏱️ Elapsed: {elapsed(start_time)} | Category {cat_idx}/{total_categories}: Saving to '{csv_file}'")
+
+                    # ensure we use the latest discovered reports base for the endpoint
+                    activity_endpoint_url = f"{REPORTS_BASE}/v2/activity/{event_type_filter}"
 
                     events_hour, token = fetch_hour_with_minute_fallback(
-                        token, client_id, client_secret, hour_start,
+                        token=token,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        hour_start_dt=hour_start,
                         limit=1000,
                         offset_ceiling=10000,
                         verbose=True,
                         rate_limiter=rate_limiter,
-                        filters=current_api_filters, # Use category-specific filters
+                        filters=current_api_filters,
                         activity_endpoint_url=activity_endpoint_url
                     )
 
-                    # --- Aplicar filtro de exclusión del lado del cliente ---
+                    # Apply exclusion filters
                     if excluded_identity_names:
-                        filtered_events_hour = []
-                        for event in events_hour:
-                            should_exclude_event = False
-                            event_identities = event.get('identities', [])
+                        events_hour = [
+                            ev for ev in events_hour
+                            if not any(
+                                (isinstance(id_data, dict) and id_data.get('label') in excluded_identity_names)
+                                for id_data in ev.get('identities', [])
+                            )
+                        ]
 
-                            for identity_data in event_identities:
-                                if isinstance(identity_data, dict): # Ensure it's a dict
-                                    identity_label = identity_data.get('label')
-                                    if identity_label and identity_label in excluded_identity_names:
-                                        should_exclude_event = True
-                                        break
+                    # Apply action filter
+                    if action_filter:
+                        events_hour = [ev for ev in events_hour if ev.get('verdict', '').lower() == action_filter]
 
-                            if not should_exclude_event:
-                                filtered_events_hour.append(event)
-                        events_hour = filtered_events_hour
-                        print(f"      🔹 Después de excluir identidades: {len(events_hour)} eventos restantes.")
-                    # --------------------------------------------------------
-
-                    print(f"   ✅ Hour OK: {len(events_hour)} eventos")
-                    save_events_function(events_hour, csv_writer) # Use the chosen function
+                    print(f"   ✅ Hour OK: {len(events_hour)} events")
+                    save_events_function(events_hour, csv_writer)
                     total_events_for_this_category += len(events_hour)
-            
-            print(f"\n🏁 Concluído! {total_events_for_this_category} eventos salvos em {csv_file}")
-            print(f"⏱️ Tempo total para esta categoria: {elapsed(start_time)}")
 
-    print(f"\n✅ All requested data collection processes completed.")
-    print(f"⏱️ Tempo total da execução do script: {elapsed(start_time)}")
+            print(f"\n🏁 Completed category {cat_idx}/{total_categories}: {total_events_for_this_category} events saved in '{csv_file}'")
+            print(f"⏱️ Total time for this category: {elapsed(start_time)}")
+
+    print(f"\n✅ All requested data collection completed.")
+    print(f"⏱️ Total script execution time: {elapsed(start_time)}")
+
 
 if __name__ == "__main__":
     main()
